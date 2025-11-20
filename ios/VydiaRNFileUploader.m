@@ -25,6 +25,20 @@
 
 @implementation MultipartInputStream
 
+@synthesize boundary = _boundary;
+@synthesize parameters = _parameters;
+@synthesize fieldName = _fieldName;
+@synthesize filename = _filename;
+@synthesize mimetype = _mimetype;
+@synthesize fileURL = _fileURL;
+@synthesize fileInputStream = _fileInputStream;
+@synthesize streamStatus = _streamStatus;
+@synthesize streamError = _streamError;
+@synthesize currentPhase = _currentPhase;
+@synthesize currentData = _currentData;
+@synthesize currentDataOffset = _currentDataOffset;
+@synthesize hasOpened = _hasOpened;
+
 - (instancetype)initWithBoundary:(NSString *)boundary
                        parameters:(NSDictionary *)parameters
                         fieldName:(NSString *)fieldName
