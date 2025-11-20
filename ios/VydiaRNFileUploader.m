@@ -216,10 +216,14 @@ RCT_EXPORT_METHOD(startUpload:(NSDictionary *)options resolve:(RCTPromiseResolve
             NSString *uuidStr = [[NSUUID UUID] UUIDString];
             [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", uuidStr] forHTTPHeaderField:@"Content-Type"];
 
-            NSData *multipartData = [self createBodyWithBoundary:uuidStr path:fileURI parameters: parameters fieldName:fieldName];
-            
             NSURL *multipartDataFileUrl = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/%@", [self getTmpDirectory], uploadId]];
-            [multipartData writeToURL:multipartDataFileUrl atomically:YES];
+            
+            // Create multipart body directly to file to avoid memory issues with large files
+            NSURL *createdFileUrl = [self createBodyWithBoundary:uuidStr path:fileURI parameters: parameters fieldName:fieldName outputFileURL:multipartDataFileUrl];
+            
+            if (createdFileUrl == nil) {
+                return reject(@"RN Uploader", @"Failed to create multipart body file", nil);
+            }
 
             uploadTask = [[self urlSession: appGroup] uploadTaskWithRequest:request fromFile:multipartDataFileUrl];
         } else {
@@ -302,12 +306,11 @@ RCT_EXPORT_METHOD(getAllUploads:(RCTPromiseResolveBlock)resolve
     }];
 }
 
-- (NSData *)createBodyWithBoundary:(NSString *)boundary
+- (NSURL *)createBodyWithBoundary:(NSString *)boundary
             path:(NSString *)path
             parameters:(NSDictionary *)parameters
-            fieldName:(NSString *)fieldName {
-
-    NSMutableData *httpBody = [NSMutableData data];
+            fieldName:(NSString *)fieldName
+            outputFileURL:(NSURL *)outputFileURL {
 
     // Escape non latin characters in filename
     NSString *escapedPath = [path stringByAddingPercentEncodingWithAllowedCharacters: NSCharacterSet.URLQueryAllowedCharacterSet];
@@ -316,30 +319,78 @@ RCT_EXPORT_METHOD(getAllUploads:(RCTPromiseResolveBlock)resolve
     NSURL *fileUri = [NSURL URLWithString: escapedPath];
     
     NSError* error = nil;
-    NSData *data = [NSData dataWithContentsOfURL:fileUri options:NSDataReadingMappedAlways error: &error];
-
-    if (data == nil) {
-        NSLog(@"Failed to read file %@", error);
+    
+    // Check if source file exists
+    NSString *filePath = [fileUri path];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+        NSLog(@"Failed to read file: file does not exist at path %@", filePath);
+        return nil;
+    }
+    
+    // Get file handle for reading source file in chunks
+    NSFileHandle *sourceFileHandle = [NSFileHandle fileHandleForReadingFromURL:fileUri error:&error];
+    if (sourceFileHandle == nil) {
+        NSLog(@"Failed to open source file for reading: %@", error);
+        return nil;
+    }
+    
+    // Create output file handle for writing multipart body
+    [[NSFileManager defaultManager] createFileAtPath:[outputFileURL path] contents:nil attributes:nil];
+    NSFileHandle *outputFileHandle = [NSFileHandle fileHandleForWritingToURL:outputFileURL error:&error];
+    if (outputFileHandle == nil) {
+        NSLog(@"Failed to create output file for writing: %@", error);
+        [sourceFileHandle closeFile];
+        return nil;
     }
 
     NSString *filename  = [path lastPathComponent];
     NSString *mimetype  = [self guessMIMETypeFromFileName:path];
 
+    // Write parameters first
     [parameters enumerateKeysAndObjectsUsingBlock:^(NSString *parameterKey, NSString *parameterValue, BOOL *stop) {
-        [httpBody appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-        [httpBody appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", parameterKey] dataUsingEncoding:NSUTF8StringEncoding]];
-        [httpBody appendData:[[NSString stringWithFormat:@"%@\r\n", parameterValue] dataUsingEncoding:NSUTF8StringEncoding]];
+        NSString *paramHeader = [NSString stringWithFormat:@"--%@\r\n", boundary];
+        NSString *paramDisposition = [NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", parameterKey];
+        NSString *paramValue = [NSString stringWithFormat:@"%@\r\n", parameterValue];
+        
+        [outputFileHandle writeData:[paramHeader dataUsingEncoding:NSUTF8StringEncoding]];
+        [outputFileHandle writeData:[paramDisposition dataUsingEncoding:NSUTF8StringEncoding]];
+        [outputFileHandle writeData:[paramValue dataUsingEncoding:NSUTF8StringEncoding]];
     }];
 
-    [httpBody appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    [httpBody appendData:[[NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n", fieldName, filename] dataUsingEncoding:NSUTF8StringEncoding]];
-    [httpBody appendData:[[NSString stringWithFormat:@"Content-Type: %@\r\n\r\n", mimetype] dataUsingEncoding:NSUTF8StringEncoding]];
-    [httpBody appendData:data];
-    [httpBody appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    // Write file header
+    NSString *fileHeader = [NSString stringWithFormat:@"--%@\r\n", boundary];
+    NSString *fileDisposition = [NSString stringWithFormat:@"Content-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n", fieldName, filename];
+    NSString *fileContentType = [NSString stringWithFormat:@"Content-Type: %@\r\n\r\n", mimetype];
+    
+    [outputFileHandle writeData:[fileHeader dataUsingEncoding:NSUTF8StringEncoding]];
+    [outputFileHandle writeData:[fileDisposition dataUsingEncoding:NSUTF8StringEncoding]];
+    [outputFileHandle writeData:[fileContentType dataUsingEncoding:NSUTF8StringEncoding]];
 
-    [httpBody appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    // Stream file data in chunks to avoid loading entire file into memory
+    // Use a reasonable chunk size (1MB) to balance memory usage and I/O efficiency
+    const NSUInteger chunkSize = 1024 * 1024; // 1MB chunks
+    [sourceFileHandle seekToFileOffset:0];
+    
+    while (YES) {
+        @autoreleasepool {
+            NSData *chunk = [sourceFileHandle readDataOfLength:chunkSize];
+            if ([chunk length] == 0) {
+                break; // End of file
+            }
+            [outputFileHandle writeData:chunk];
+        }
+    }
 
-    return httpBody;
+    // Write closing boundary
+    [outputFileHandle writeData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    NSString *closingBoundary = [NSString stringWithFormat:@"--%@--\r\n", boundary];
+    [outputFileHandle writeData:[closingBoundary dataUsingEncoding:NSUTF8StringEncoding]];
+
+    // Close file handles
+    [sourceFileHandle closeFile];
+    [outputFileHandle closeFile];
+
+    return outputFileURL;
 }
 
 - (NSURLSession *)urlSession: (NSString *) groupId {
