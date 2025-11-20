@@ -6,6 +6,181 @@
 
 #import "VydiaRNFileUploader.h"
 
+// Custom NSInputStream subclass that generates multipart/form-data on-the-fly
+@interface MultipartInputStream : NSInputStream <NSStreamDelegate>
+@property (nonatomic, strong) NSString *boundary;
+@property (nonatomic, strong) NSDictionary *parameters;
+@property (nonatomic, strong) NSString *fieldName;
+@property (nonatomic, strong) NSString *filename;
+@property (nonatomic, strong) NSString *mimetype;
+@property (nonatomic, strong) NSURL *fileURL;
+@property (nonatomic, strong) NSInputStream *fileInputStream;
+@property (nonatomic, assign) NSStreamStatus streamStatus;
+@property (nonatomic, strong) NSError *streamError;
+@property (nonatomic, assign) NSInteger currentPhase; // 0: params, 1: file header, 2: file data, 3: closing
+@property (nonatomic, strong) NSData *currentData;
+@property (nonatomic, assign) NSUInteger currentDataOffset;
+@property (nonatomic, assign) BOOL hasOpened;
+@end
+
+@implementation MultipartInputStream
+
+- (instancetype)initWithBoundary:(NSString *)boundary
+                       parameters:(NSDictionary *)parameters
+                        fieldName:(NSString *)fieldName
+                         filename:(NSString *)filename
+                         mimetype:(NSString *)mimetype
+                          fileURL:(NSURL *)fileURL {
+    self = [super init];
+    if (self) {
+        _boundary = boundary;
+        _parameters = parameters ?: @{};
+        _fieldName = fieldName;
+        _filename = filename;
+        _mimetype = mimetype;
+        _fileURL = fileURL;
+        _streamStatus = NSStreamStatusNotOpen;
+        _currentPhase = 0;
+        _currentDataOffset = 0;
+        _hasOpened = NO;
+    }
+    return self;
+}
+
+- (void)open {
+    if (_hasOpened) return;
+    _hasOpened = YES;
+    _streamStatus = NSStreamStatusOpen;
+    
+    // Open file input stream
+    _fileInputStream = [NSInputStream inputStreamWithURL:_fileURL];
+    if (_fileInputStream) {
+        [_fileInputStream open];
+    }
+    
+    // Prepare first phase (parameters)
+    [self prepareNextPhase];
+}
+
+- (void)close {
+    _streamStatus = NSStreamStatusClosed;
+    [_fileInputStream close];
+    _fileInputStream = nil;
+    _currentData = nil;
+}
+
+- (NSInteger)read:(uint8_t *)buffer maxLength:(NSUInteger)len {
+    if (_streamStatus == NSStreamStatusError || _streamStatus == NSStreamStatusClosed) {
+        return -1;
+    }
+    
+    NSInteger totalBytesRead = 0;
+    
+    while (totalBytesRead < len && _streamStatus == NSStreamStatusOpen) {
+        // If we've consumed current phase data, move to next phase
+        if (!_currentData || _currentDataOffset >= _currentData.length) {
+            if (![self prepareNextPhase]) {
+                // No more data
+                break;
+            }
+        }
+        
+        // Read from current data
+        NSUInteger remainingInCurrent = _currentData.length - _currentDataOffset;
+        NSUInteger bytesToRead = MIN(len - totalBytesRead, remainingInCurrent);
+        
+        if (bytesToRead > 0) {
+            memcpy(buffer + totalBytesRead, _currentData.bytes + _currentDataOffset, bytesToRead);
+            _currentDataOffset += bytesToRead;
+            totalBytesRead += bytesToRead;
+        }
+    }
+    
+    return totalBytesRead > 0 ? totalBytesRead : 0;
+}
+
+- (BOOL)prepareNextPhase {
+    _currentDataOffset = 0;
+    
+    if (_currentPhase == 0) {
+        // Write parameters
+        NSMutableData *paramsData = [NSMutableData data];
+        [_parameters enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
+            NSString *paramPart = [NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"%@\"\r\n\r\n%@\r\n", _boundary, key, value];
+            [paramsData appendData:[paramPart dataUsingEncoding:NSUTF8StringEncoding]];
+        }];
+        _currentData = paramsData;
+        _currentPhase = 1;
+        return YES;
+    } else if (_currentPhase == 1) {
+        // Write file header
+        NSString *fileHeader = [NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\nContent-Type: %@\r\n\r\n", _boundary, _fieldName, _filename, _mimetype];
+        _currentData = [fileHeader dataUsingEncoding:NSUTF8StringEncoding];
+        _currentPhase = 2;
+        return YES;
+    } else if (_currentPhase == 2) {
+        // Stream file data in chunks
+        if (_fileInputStream && [_fileInputStream hasBytesAvailable]) {
+            const NSUInteger chunkSize = 64 * 1024; // 64KB chunks
+            uint8_t *buffer = (uint8_t *)malloc(chunkSize);
+            if (buffer) {
+                NSInteger bytesRead = [_fileInputStream read:buffer maxLength:chunkSize];
+                if (bytesRead > 0) {
+                    // Copy the data to avoid buffer management issues
+                    _currentData = [NSData dataWithBytes:buffer length:bytesRead];
+                    free(buffer);
+                    return YES;
+                } else {
+                    free(buffer);
+                    // File stream ended, move to closing phase
+                    _currentPhase = 3;
+                }
+            }
+        } else {
+            // File stream ended, move to closing phase
+            _currentPhase = 3;
+        }
+    }
+    
+    if (_currentPhase == 3) {
+        // Write closing boundary
+        NSString *closing = [NSString stringWithFormat:@"\r\n--%@--\r\n", _boundary];
+        _currentData = [closing dataUsingEncoding:NSUTF8StringEncoding];
+        _currentPhase = 4; // Done after this
+        return YES;
+    }
+    
+    // All phases complete
+    _streamStatus = NSStreamStatusAtEnd;
+    return NO;
+}
+
+- (BOOL)hasBytesAvailable {
+    if (_streamStatus == NSStreamStatusAtEnd || _streamStatus == NSStreamStatusClosed) {
+        return NO;
+    }
+    if (_currentData && _currentDataOffset < _currentData.length) {
+        return YES;
+    }
+    if (_currentPhase == 2 && _fileInputStream && [_fileInputStream hasBytesAvailable]) {
+        return YES;
+    }
+    if (_currentPhase < 4) {
+        return YES; // Still have phases to process
+    }
+    return NO;
+}
+
+- (NSStreamStatus)streamStatus {
+    return _streamStatus;
+}
+
+- (NSError *)streamError {
+    return _streamError;
+}
+
+@end
+
 @implementation VydiaRNFileUploader
 
 RCT_EXPORT_MODULE();
@@ -216,15 +391,72 @@ RCT_EXPORT_METHOD(startUpload:(NSDictionary *)options resolve:(RCTPromiseResolve
             NSString *uuidStr = [[NSUUID UUID] UUIDString];
             [request setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", uuidStr] forHTTPHeaderField:@"Content-Type"];
 
+            // Resolve file URL
+            NSString *escapedPath = [fileURI stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet];
+            NSURL *fileUrl = [NSURL URLWithString:escapedPath];
+            NSString *filePath = [fileUrl path];
+            
+            // Verify file exists
+            if (![[NSFileManager defaultManager] fileExistsAtPath:filePath]) {
+                return reject(@"RN Uploader", @"File does not exist", nil);
+            }
+            
+            // Get filename and mimetype
+            NSString *filename = [fileURI lastPathComponent];
+            NSString *mimetype = [self guessMIMETypeFromFileName:fileURI];
+            
+            // Create multipart file using streaming approach (writes directly to file as data is generated)
             NSURL *multipartDataFileUrl = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/%@", [self getTmpDirectory], uploadId]];
             
-            // Create multipart body directly to file to avoid memory issues with large files
-            NSURL *createdFileUrl = [self createBodyWithBoundary:uuidStr path:fileURI parameters: parameters fieldName:fieldName outputFileURL:multipartDataFileUrl];
+            // Use custom stream to write multipart data directly to file
+            MultipartInputStream *multipartStream = [[MultipartInputStream alloc] initWithBoundary:uuidStr
+                                                                                        parameters:parameters
+                                                                                         fieldName:fieldName
+                                                                                          filename:filename
+                                                                                          mimetype:mimetype
+                                                                                           fileURL:fileUrl];
             
-            if (createdFileUrl == nil) {
-                return reject(@"RN Uploader", @"Failed to create multipart body file", nil);
+            [multipartStream open];
+            
+            // Ensure output directory exists
+            NSString *outputDir = [[multipartDataFileUrl path] stringByDeletingLastPathComponent];
+            NSFileManager *fileManager = [NSFileManager defaultManager];
+            if (![fileManager fileExistsAtPath:outputDir]) {
+                [fileManager createDirectoryAtPath:outputDir withIntermediateDirectories:YES attributes:nil error:nil];
             }
-
+            
+            // Create output file and write stream data to it
+            [fileManager createFileAtPath:[multipartDataFileUrl path] contents:nil attributes:nil];
+            NSFileHandle *outputHandle = [NSFileHandle fileHandleForWritingToURL:multipartDataFileUrl error:nil];
+            
+            if (outputHandle == nil) {
+                [multipartStream close];
+                return reject(@"RN Uploader", @"Failed to create output file", nil);
+            }
+            
+            // Stream data from multipart stream to file
+            const NSUInteger bufferSize = 64 * 1024; // 64KB buffer
+            uint8_t *buffer = (uint8_t *)malloc(bufferSize);
+            if (buffer == NULL) {
+                [multipartStream close];
+                [outputHandle closeFile];
+                return reject(@"RN Uploader", @"Failed to allocate buffer", nil);
+            }
+            
+            @try {
+                while ([multipartStream hasBytesAvailable]) {
+                    @autoreleasepool {
+                        NSInteger bytesRead = [multipartStream read:buffer maxLength:bufferSize];
+                        if (bytesRead <= 0) break;
+                        [outputHandle writeData:[NSData dataWithBytes:buffer length:bytesRead]];
+                    }
+                }
+            } @finally {
+                free(buffer);
+                [multipartStream close];
+                [outputHandle closeFile];
+            }
+            
             uploadTask = [[self urlSession: appGroup] uploadTaskWithRequest:request fromFile:multipartDataFileUrl];
         } else {
             if (parameters.count > 0) {
@@ -306,7 +538,7 @@ RCT_EXPORT_METHOD(getAllUploads:(RCTPromiseResolveBlock)resolve
     }];
 }
 
-- (NSURL *)createBodyWithBoundary:(NSString *)boundary
+- (NSURL *)createBodyWithBoundaryStreaming:(NSString *)boundary
             path:(NSString *)path
             parameters:(NSDictionary *)parameters
             fieldName:(NSString *)fieldName
@@ -327,19 +559,31 @@ RCT_EXPORT_METHOD(getAllUploads:(RCTPromiseResolveBlock)resolve
         return nil;
     }
     
-    // Get file handle for reading source file in chunks
-    NSFileHandle *sourceFileHandle = [NSFileHandle fileHandleForReadingFromURL:fileUri error:&error];
-    if (sourceFileHandle == nil) {
-        NSLog(@"Failed to open source file for reading: %@", error);
-        return nil;
+    // Ensure output directory exists
+    NSString *outputDir = [[outputFileURL path] stringByDeletingLastPathComponent];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    if (![fileManager fileExistsAtPath:outputDir]) {
+        [fileManager createDirectoryAtPath:outputDir withIntermediateDirectories:YES attributes:nil error:&error];
+        if (error != nil) {
+            NSLog(@"Failed to create output directory: %@", error);
+            return nil;
+        }
     }
     
+    // Use NSInputStream for efficient streaming of large files
+    NSInputStream *inputStream = [NSInputStream inputStreamWithURL:fileUri];
+    if (inputStream == nil) {
+        NSLog(@"Failed to create input stream for file: %@", filePath);
+        return nil;
+    }
+    [inputStream open];
+    
     // Create output file handle for writing multipart body
-    [[NSFileManager defaultManager] createFileAtPath:[outputFileURL path] contents:nil attributes:nil];
+    [fileManager createFileAtPath:[outputFileURL path] contents:nil attributes:nil];
     NSFileHandle *outputFileHandle = [NSFileHandle fileHandleForWritingToURL:outputFileURL error:&error];
     if (outputFileHandle == nil) {
         NSLog(@"Failed to create output file for writing: %@", error);
-        [sourceFileHandle closeFile];
+        [inputStream close];
         return nil;
     }
 
@@ -366,19 +610,47 @@ RCT_EXPORT_METHOD(getAllUploads:(RCTPromiseResolveBlock)resolve
     [outputFileHandle writeData:[fileDisposition dataUsingEncoding:NSUTF8StringEncoding]];
     [outputFileHandle writeData:[fileContentType dataUsingEncoding:NSUTF8StringEncoding]];
 
-    // Stream file data in chunks to avoid loading entire file into memory
-    // Use a reasonable chunk size (1MB) to balance memory usage and I/O efficiency
-    const NSUInteger chunkSize = 1024 * 1024; // 1MB chunks
-    [sourceFileHandle seekToFileOffset:0];
+    // Stream file data in chunks using NSInputStream to avoid loading entire file into memory
+    // Use a conservative chunk size (256KB) to minimize memory usage
+    const NSUInteger bufferSize = 256 * 1024; // 256KB buffer
+    uint8_t *buffer = (uint8_t *)malloc(bufferSize);
+    if (buffer == NULL) {
+        NSLog(@"Failed to allocate buffer for file streaming");
+        [inputStream close];
+        [outputFileHandle closeFile];
+        return nil;
+    }
     
-    while (YES) {
-        @autoreleasepool {
-            NSData *chunk = [sourceFileHandle readDataOfLength:chunkSize];
-            if ([chunk length] == 0) {
-                break; // End of file
+    @try {
+        NSStreamStatus streamStatus = [inputStream streamStatus];
+        while (streamStatus == NSStreamStatusOpen || streamStatus == NSStreamStatusReading) {
+            @autoreleasepool {
+                NSInteger bytesRead = [inputStream read:buffer maxLength:bufferSize];
+                if (bytesRead < 0) {
+                    // Error reading from stream
+                    NSStreamStatus errorStatus = [inputStream streamStatus];
+                    if (errorStatus == NSStreamStatusError) {
+                        NSError *streamError = [inputStream streamError];
+                        NSLog(@"Error reading from input stream: %@", streamError);
+                    }
+                    break;
+                }
+                if (bytesRead == 0) {
+                    // End of stream
+                    break;
+                }
+                
+                // Copy the data to avoid issues with buffer reuse
+                NSData *chunk = [NSData dataWithBytes:buffer length:bytesRead];
+                [outputFileHandle writeData:chunk];
+                
+                // Check stream status for next iteration
+                streamStatus = [inputStream streamStatus];
             }
-            [outputFileHandle writeData:chunk];
         }
+    } @finally {
+        free(buffer);
+        [inputStream close];
     }
 
     // Write closing boundary
@@ -386,8 +658,7 @@ RCT_EXPORT_METHOD(getAllUploads:(RCTPromiseResolveBlock)resolve
     NSString *closingBoundary = [NSString stringWithFormat:@"--%@--\r\n", boundary];
     [outputFileHandle writeData:[closingBoundary dataUsingEncoding:NSUTF8StringEncoding]];
 
-    // Close file handles
-    [sourceFileHandle closeFile];
+    // Close file handle
     [outputFileHandle closeFile];
 
     return outputFileURL;
