@@ -528,7 +528,20 @@ RCT_EXPORT_METHOD(startUpload:(NSDictionary *)options resolve:(RCTPromiseResolve
                     } @finally {
                         free(buffer);
                         [multipartStream close];
+                        [outputHandle synchronizeFile]; // Sync file to disk before closing
                         [outputHandle closeFile];
+                    }
+                    
+                    // Double-check file exists and has content before proceeding
+                    NSFileManager *checkManager = [NSFileManager defaultManager];
+                    NSDictionary *fileAttributes = [checkManager attributesOfItemAtPath:[multipartDataFileUrl path] error:nil];
+                    unsigned long long fileSize = [fileAttributes fileSize];
+                    
+                    if (fileSize == 0) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            reject(@"RN Uploader", @"Multipart file is empty", nil);
+                        });
+                        return;
                     }
                     
                     // Handle stream errors
