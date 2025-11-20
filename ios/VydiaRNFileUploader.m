@@ -80,7 +80,11 @@
         // If we've consumed current phase data, move to next phase
         if (!_currentData || _currentDataOffset >= _currentData.length) {
             if (![self prepareNextPhase]) {
-                // No more data
+                // Check if it's an error or just end of stream
+                if (_streamStatus == NSStreamStatusError) {
+                    return -1;
+                }
+                // No more data (end of stream)
                 break;
             }
         }
@@ -123,7 +127,16 @@
         if (_fileInputStream && [_fileInputStream hasBytesAvailable]) {
             const NSUInteger chunkSize = 64 * 1024; // 64KB chunks
             uint8_t *buffer = (uint8_t *)malloc(chunkSize);
-            if (buffer) {
+            if (buffer == NULL) {
+                // Memory allocation failed - set error and return NO
+                _streamStatus = NSStreamStatusError;
+                NSMutableDictionary* details = [NSMutableDictionary dictionary];
+                [details setValue:@"Failed to allocate memory for file streaming" forKey:NSLocalizedDescriptionKey];
+                _streamError = [NSError errorWithDomain:@"MultipartInputStream" code:1 userInfo:details];
+                return NO;
+            }
+            
+            @try {
                 NSInteger bytesRead = [_fileInputStream read:buffer maxLength:chunkSize];
                 if (bytesRead > 0) {
                     // Copy the data to avoid buffer management issues
@@ -135,6 +148,13 @@
                     // File stream ended, move to closing phase
                     _currentPhase = 3;
                 }
+            } @catch (NSException *exception) {
+                free(buffer);
+                _streamStatus = NSStreamStatusError;
+                NSMutableDictionary* details = [NSMutableDictionary dictionary];
+                [details setValue:[NSString stringWithFormat:@"Error reading file stream: %@", exception.reason] forKey:NSLocalizedDescriptionKey];
+                _streamError = [NSError errorWithDomain:@"MultipartInputStream" code:2 userInfo:details];
+                return NO;
             }
         } else {
             // File stream ended, move to closing phase
@@ -408,56 +428,124 @@ RCT_EXPORT_METHOD(startUpload:(NSDictionary *)options resolve:(RCTPromiseResolve
             // Create multipart file using streaming approach (writes directly to file as data is generated)
             NSURL *multipartDataFileUrl = [NSURL fileURLWithPath:[NSString stringWithFormat:@"%@/%@", [self getTmpDirectory], uploadId]];
             
-            // Use custom stream to write multipart data directly to file
-            MultipartInputStream *multipartStream = [[MultipartInputStream alloc] initWithBoundary:uuidStr
-                                                                                        parameters:parameters
-                                                                                         fieldName:fieldName
-                                                                                          filename:filename
-                                                                                          mimetype:mimetype
-                                                                                           fileURL:fileUrl];
-            
-            [multipartStream open];
-            
-            // Ensure output directory exists
-            NSString *outputDir = [[multipartDataFileUrl path] stringByDeletingLastPathComponent];
-            NSFileManager *fileManager = [NSFileManager defaultManager];
-            if (![fileManager fileExistsAtPath:outputDir]) {
-                [fileManager createDirectoryAtPath:outputDir withIntermediateDirectories:YES attributes:nil error:nil];
-            }
-            
-            // Create output file and write stream data to it
-            [fileManager createFileAtPath:[multipartDataFileUrl path] contents:nil attributes:nil];
-            NSFileHandle *outputHandle = [NSFileHandle fileHandleForWritingToURL:multipartDataFileUrl error:nil];
-            
-            if (outputHandle == nil) {
-                [multipartStream close];
-                return reject(@"RN Uploader", @"Failed to create output file", nil);
-            }
-            
-            // Stream data from multipart stream to file
-            const NSUInteger bufferSize = 64 * 1024; // 64KB buffer
-            uint8_t *buffer = (uint8_t *)malloc(bufferSize);
-            if (buffer == NULL) {
-                [multipartStream close];
-                [outputHandle closeFile];
-                return reject(@"RN Uploader", @"Failed to allocate buffer", nil);
-            }
-            
-            @try {
-                while ([multipartStream hasBytesAvailable]) {
-                    @autoreleasepool {
-                        NSInteger bytesRead = [multipartStream read:buffer maxLength:bufferSize];
-                        if (bytesRead <= 0) break;
-                        [outputHandle writeData:[NSData dataWithBytes:buffer length:bytesRead]];
+            // Move file writing to background queue to avoid blocking main thread and reduce memory pressure
+            dispatch_queue_t backgroundQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+            dispatch_async(backgroundQueue, ^{
+                @try {
+                    // Use custom stream to write multipart data directly to file
+                    MultipartInputStream *multipartStream = [[MultipartInputStream alloc] initWithBoundary:uuidStr
+                                                                                                parameters:parameters
+                                                                                                 fieldName:fieldName
+                                                                                                  filename:filename
+                                                                                                  mimetype:mimetype
+                                                                                                   fileURL:fileUrl];
+                    
+                    [multipartStream open];
+                    
+                    // Ensure output directory exists
+                    NSString *outputDir = [[multipartDataFileUrl path] stringByDeletingLastPathComponent];
+                    NSFileManager *fileManager = [NSFileManager defaultManager];
+                    NSError *dirError = nil;
+                    if (![fileManager fileExistsAtPath:outputDir]) {
+                        [fileManager createDirectoryAtPath:outputDir withIntermediateDirectories:YES attributes:nil error:&dirError];
+                        if (dirError != nil) {
+                            [multipartStream close];
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                reject(@"RN Uploader", @"Failed to create output directory", nil);
+                            });
+                            return;
+                        }
                     }
+                    
+                    // Create output file and write stream data to it
+                    [fileManager createFileAtPath:[multipartDataFileUrl path] contents:nil attributes:nil];
+                    NSError *fileHandleError = nil;
+                    NSFileHandle *outputHandle = [NSFileHandle fileHandleForWritingToURL:multipartDataFileUrl error:&fileHandleError];
+                    
+                    if (outputHandle == nil || fileHandleError != nil) {
+                        [multipartStream close];
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            reject(@"RN Uploader", @"Failed to create output file", nil);
+                        });
+                        return;
+                    }
+                    
+                    // Stream data from multipart stream to file
+                    const NSUInteger bufferSize = 64 * 1024; // 64KB buffer
+                    uint8_t *buffer = (uint8_t *)malloc(bufferSize);
+                    if (buffer == NULL) {
+                        [multipartStream close];
+                        [outputHandle closeFile];
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            reject(@"RN Uploader", @"Failed to allocate buffer", nil);
+                        });
+                        return;
+                    }
+                    
+                    BOOL streamError = NO;
+                    NSError *streamErrorObj = nil;
+                    @try {
+                        while ([multipartStream hasBytesAvailable]) {
+                            @autoreleasepool {
+                                NSInteger bytesRead = [multipartStream read:buffer maxLength:bufferSize];
+                                if (bytesRead < 0) {
+                                    // Error reading from stream
+                                    streamError = YES;
+                                    streamErrorObj = [multipartStream streamError];
+                                    break;
+                                }
+                                if (bytesRead == 0) {
+                                    // End of stream
+                                    break;
+                                }
+                                
+                                // Create NSData and write immediately to minimize memory usage
+                                NSData *chunkData = [NSData dataWithBytes:buffer length:bytesRead];
+                                [outputHandle writeData:chunkData];
+                                chunkData = nil; // Explicitly release reference
+                            }
+                        }
+                        
+                        // Check for stream errors after loop
+                        if ([multipartStream streamStatus] == NSStreamStatusError) {
+                            streamError = YES;
+                            streamErrorObj = [multipartStream streamError];
+                        }
+                    } @finally {
+                        free(buffer);
+                        [multipartStream close];
+                        [outputHandle closeFile];
+                    }
+                    
+                    // Handle stream errors
+                    if (streamError) {
+                        NSString *errorMessage = streamErrorObj ? streamErrorObj.localizedDescription : @"Error reading from file stream";
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            reject(@"RN Uploader", errorMessage, nil);
+                        });
+                        return;
+                    }
+                    
+                    // Create upload task and resume on main thread
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        @try {
+                            NSURLSessionUploadTask *uploadTask = [[self urlSession: appGroup] uploadTaskWithRequest:request fromFile:multipartDataFileUrl];
+                            uploadTask.taskDescription = uploadId;
+                            [uploadTask resume];
+                            resolve(uploadTask.taskDescription);
+                        } @catch (NSException *exception) {
+                            reject(@"RN Uploader", exception.name, nil);
+                        }
+                    });
+                } @catch (NSException *exception) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        reject(@"RN Uploader", exception.name, nil);
+                    });
                 }
-            } @finally {
-                free(buffer);
-                [multipartStream close];
-                [outputHandle closeFile];
-            }
+            });
             
-            uploadTask = [[self urlSession: appGroup] uploadTaskWithRequest:request fromFile:multipartDataFileUrl];
+            // Return early since we're handling resolve/reject in the async block
+            return;
         } else {
             if (parameters.count > 0) {
                 reject(@"RN Uploader", @"Parameters supported only in multipart type", nil);
